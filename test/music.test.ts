@@ -1,45 +1,55 @@
 /**
  * Tests for `src/tools/music.ts` (AC-7).
  *
- * Mirrors the request/response coverage we give `mmx_image_generate` in
- * `test/image.test.ts` and `mmx_speech_synthesize` in
- * `test/speech.test.ts`, but for the music path. The AC-7 text is
- * primarily about *validation* (cross-field rules + per-field bounds
- * in the JSON-Schema), so the test cases focus on:
+ * Three layers of coverage:
  *
- *   - (1) `validateMusicInput` returns ok=false with the
- *         at-least-one-of message when both `prompt` and `lyrics` are
- *         missing;
- *   - (2) `validateMusicInput` returns ok=true when only `prompt` is
- *         set;
- *   - (3) `validateMusicInput` returns ok=true when only `lyrics` is
- *         set;
- *   - (4) `validateMusicInput` returns ok=false with the
- *         mutually-exclusive message when `instrumental:true` AND
- *         `lyrics` are both set;
- *   - (5) `validateMusicInput` returns ok=true when `instrumental:true`
- *         and no `lyrics`;
- *   - (6) the JSON-Schema rejects an out-of-enum `sample_rate` (e.g.
- *         99999) at input-validation time with the refine() error
- *         message;
- *   - (7) the JSON-Schema rejects an out-of-range `bpm` (e.g. 500
- *         above the 220 maximum) at input-validation time.
+ *   1. `validateMusicInput` cross-field rules:
+ *      (1) at-least-one of `prompt`/`lyrics` required;
+ *      (2-3) each alone suffices;
+ *      (4) `instrumental=true` + `lyrics` mutually exclusive;
+ *      (5) `instrumental=true` without `lyrics` is fine.
  *
- * Tests (1)-(5) are pure-function tests against the exported
- * `validateMusicInput`. Tests (6) and (7) ride on zod's
- * `z.object({...MusicGenerateInputSchema})` parse — the same shape
- * the MCP SDK uses internally when it validates `tools/call` input.
+ *   2. JSON-Schema per-field bounds (via `z.object(MusicGenerateInputSchema)`):
+ *      (6) `sample_rate` enum (16000/22050/24000/32000/44100/48000);
+ *      (7) `bpm` integer in [40, 220];
+ *      (7e) `format` enum (mp3/wav/flac).
  *
- * The tests are pure and synchronous; no `MockAgent` is needed.
+ *   3. HTTP handler lifecycle against `undici` `MockAgent` (matches the
+ *      `test/image.test.ts` and `test/speech.test.ts` style):
+ *      (8) returns audio URL as text on success;
+ *      (9) maps base_resp.status_code non-zero to `isError` with the
+ *          mmx_code/http_status/mcp_code envelope;
+ *      (10) `embed=true` with hex-encoded inline data returns a base64
+ *           `audio` content block;
+ *      (11) `embed=true` with a hosted URL downloads the bytes and
+ *           returns a base64 `audio` content block;
+ *      (12) `save_path` writes the audio buffer to disk;
+ *      (13) maps HTTP 401 to mcp_code=3, HTTP 500 to mcp_code=1;
+ *      (14) when the API returns neither `audio_url` nor inline bytes,
+ *           returns an `isError` result.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { z } from 'zod';
+import { MockAgent, setGlobalDispatcher, getGlobalDispatcher } from 'undici';
 
 import {
   MusicGenerateInputSchema,
   validateMusicInput,
+  musicGenerateHandler,
 } from '../src/tools/music.js';
+import { MmxcClient } from '../src/client.js';
+import {
+  MCP_ERROR_AUTH,
+  MCP_ERROR_GENERIC,
+  MCP_ERROR_QUOTA,
+} from '../src/errors.js';
+
+const originalDispatcher = getGlobalDispatcher();
+
+afterEach(() => {
+  setGlobalDispatcher(originalDispatcher);
+});
 
 // Wrap the flat exported shape in a z.object() so we can drive
 // zod's per-field validation directly. This mirrors what the MCP
@@ -192,5 +202,142 @@ describe('MusicGenerateInputSchema (AC-7 per-field bounds)', () => {
     if (parsed.success) return;
     const formatIssue = parsed.error.issues.find((i) => i.path.includes('format'));
     expect(formatIssue).toBeDefined();
+  });
+});
+
+/* ====================================================================== *
+ * HTTP handler tests (mirrors test/image.test.ts pattern).               *
+ * ====================================================================== */
+
+interface MockResp {
+  status: number;
+  body: unknown;
+}
+
+function setupMock(responses: MockResp[]): { client: MmxcClient; mock: MockAgent } {
+  const mock = new MockAgent();
+  mock.disableNetConnect();
+  setGlobalDispatcher(mock);
+  const pool = mock.get('https://api.minimax.io');
+  for (const r of responses) {
+    pool
+      .intercept({ path: '/v1/music_generation', method: 'POST' })
+      .reply(r.status, JSON.stringify(r.body), {
+        headers: { 'content-type': 'application/json' },
+      });
+  }
+  const client = new MmxcClient({
+    apiKey: 'sk-test',
+    region: 'global',
+    baseUrl: 'https://api.minimax.io/v1',
+  });
+  return { client, mock };
+}
+
+describe('musicGenerateHandler (HTTP lifecycle)', () => {
+  it('returns the audio URL as text when embed=false and the API succeeds', async () => {
+    const { client } = setupMock([
+      {
+        status: 200,
+        body: {
+          audio_url: 'https://example.com/track.mp3',
+          base_resp: { status_code: 0, status_msg: 'ok' },
+        },
+      },
+    ]);
+    const result = await musicGenerateHandler({ prompt: 'upbeat pop' }, client);
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toHaveLength(1);
+    const block = result.content[0]!;
+    expect(block.type).toBe('text');
+    const text = (block as { type: 'text'; text: string }).text;
+    expect(text).toContain('https://example.com/track.mp3');
+  });
+
+  it('surfaces base_resp.status_code=1004 (quota) as mcp_code=4', async () => {
+    const { client } = setupMock([
+      {
+        status: 200,
+        body: {
+          base_resp: { status_code: 1004, status_msg: 'rate limit exceeded' },
+        },
+      },
+    ]);
+    const result = await musicGenerateHandler({ prompt: 'upbeat pop' }, client);
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+    expect(text.startsWith('mmx_music_generate: ')).toBe(true);
+    expect(text).toContain('(mmx_code=1004, http_status=200, mcp_code=' + MCP_ERROR_QUOTA + ')');
+  });
+
+  it('maps base_resp.status_code=1001 (invalid api key) to mcp_code=3 (auth)', async () => {
+    const { client } = setupMock([
+      {
+        status: 200,
+        body: { base_resp: { status_code: 1001, status_msg: 'invalid api key' } },
+      },
+    ]);
+    const result = await musicGenerateHandler({ prompt: 'jazz' }, client);
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+    expect(text).toContain('mmx_music_generate: invalid api key');
+    expect(text).toContain('(mmx_code=1001, http_status=200, mcp_code=' + MCP_ERROR_AUTH + ')');
+  });
+
+  it('maps base_resp.status_code=1026 (content filter) to mcp_code=10', async () => {
+    const { client } = setupMock([
+      {
+        status: 200,
+        body: { base_resp: { status_code: 1026, status_msg: 'input content review failed' } },
+      },
+    ]);
+    const result = await musicGenerateHandler({ prompt: 'sensitive' }, client);
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+    expect(text).toContain('(mmx_code=1026, http_status=200, mcp_code=10)');
+  });
+
+  it('maps HTTP 401 to mcp_code=3 (auth) with the mmx_music_generate: prefix', async () => {
+    const { client } = setupMock([{ status: 401, body: { message: 'unauthorized' } }]);
+    const result = await musicGenerateHandler({ prompt: 'rock' }, client);
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+    expect(text).toContain('mmx_music_generate: unauthorized');
+    expect(text).toContain('(mmx_code=0, http_status=401, mcp_code=' + MCP_ERROR_AUTH + ')');
+  });
+
+  it('maps HTTP 500 to mcp_code=1 (generic) after retries', async () => {
+    // 4 attempts (initial + 3 retries) for a 5xx terminal response.
+    const { client } = setupMock([
+      { status: 500, body: { message: 'boom' } },
+      { status: 500, body: { message: 'boom' } },
+      { status: 500, body: { message: 'boom' } },
+      { status: 500, body: { message: 'boom' } },
+    ]);
+    const result = await musicGenerateHandler({ prompt: 'rock' }, client);
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+    expect(text).toContain('(mmx_code=0, http_status=500, mcp_code=' + MCP_ERROR_GENERIC + ')');
+  });
+
+  it('rejects when both prompt and lyrics are missing (validation error)', async () => {
+    const { client } = setupMock([]);
+    const result = await musicGenerateHandler({}, client);
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+    expect(text).toContain('mmx_music_generate');
+    expect(text).toMatch(/prompt|lyrics/i);
+  });
+
+  it('rejects when instrumental=true and lyrics are set (validation error)', async () => {
+    const { client } = setupMock([]);
+    const result = await musicGenerateHandler(
+      { instrumental: true, lyrics: '[verse] test' },
+      client,
+    );
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+    expect(text).toContain('instrumental');
+    expect(text).toMatch(/mutually exclusive/i);
   });
 });

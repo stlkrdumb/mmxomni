@@ -10,6 +10,8 @@
 
 import { z } from 'zod';
 import { request as undiciRequest } from 'undici';
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 import { MmxcError, normalizeApiError } from '../errors.js';
 import { log } from '../log.js';
@@ -298,7 +300,7 @@ export async function musicGenerateHandler(
   // If embed is requested and we have a URL, download the bytes.
   if (embed && sourceUrl && !audioData) {
     try {
-      const { request as undiciRequest } = await import('undici');
+      // undiciRequest is imported at module level
       const dlRes = await undiciRequest(sourceUrl);
       if (dlRes.statusCode >= 200 && dlRes.statusCode < 300) {
         const ab = await dlRes.body.arrayBuffer();
@@ -329,8 +331,8 @@ export async function musicGenerateHandler(
   const savedPaths: string[] = [];
   if (savePath && audioData) {
     try {
-      const { mkdir, writeFile } = await import('node:fs/promises');
-      const { dirname } = await import('node:path');
+      // mkdir/writeFile already imported at top level
+      // dirname already imported at top level
       await mkdir(dirname(savePath), { recursive: true });
       await writeFile(savePath, Buffer.from(audioData, 'base64'));
       savedPaths.push(savePath);
@@ -339,9 +341,9 @@ export async function musicGenerateHandler(
     }
   } else if (savePath && sourceUrl) {
     try {
-      const { mkdir, writeFile } = await import('node:fs/promises');
-      const { dirname } = await import('node:path');
-      const { request as undiciRequest } = await import('undici');
+      // mkdir/writeFile already imported at top level
+      // dirname already imported at top level
+      // undiciRequest already imported at top level
       await mkdir(dirname(savePath), { recursive: true });
       const dlRes = await undiciRequest(sourceUrl);
       if (dlRes.statusCode >= 200 && dlRes.statusCode < 300) {
