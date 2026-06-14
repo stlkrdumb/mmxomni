@@ -4,6 +4,26 @@
 
 Expose image generation, text-to-speech, music, and video generation from [MiniMax](https://platform.minimax.io) as MCP tools. Works with any MCP-aware host: Open WebUI, Claude Desktop, Cursor, and more.
 
+## Features
+
+| Category | Tool / Capability | Status |
+|---|---|---|
+| 🖼️ Image Generation | `mmx_image_generate` — text-to-image (`image-01`) | ✅ |
+| 🎤 Text-to-Speech | `mmx_speech_synthesize` — TTS with voice control | ✅ |
+| 🎵 Music Generation | `mmx_music_generate` — style/lyrics to audio (`music-2.5`) | ✅ |
+| 🎬 Video Generation | `mmx_video_generate` — async + sync (`MiniMax-Hailuo-2.3`) | ✅ |
+| 📊 Video Status | `mmx_video_status` — poll task progress | ✅ |
+| ⬇️ Video Download | `mmx_video_download` — save generated files | ✅ |
+| 👁️ Vision (bonus) | `mmx_vision_describe` — describe an image | ✅ |
+| 🔍 Web Search (bonus) | `mmx_search_query` — web search via MiniMax | ✅ |
+| 📋 Quota (bonus) | `mmx_quota_show` — inspect remaining Token Plan quota | ✅ |
+| 🔐 Auth | CLI flag, env var, `~/.mmx/credentials.json`, `~/.mmx/config.json` | ✅ |
+| 🌐 Region | `global` / `cn` base URL switching | ✅ |
+| 🔄 Retry | Exponential backoff on 429/5xx (up to 3 retries) | ✅ |
+| 📝 Logging | stderr-only with `--log-level` (`error|warn|info|debug`) | ✅ |
+| 🧪 Testing | 120+ unit tests using `undici` `MockAgent`, no live network | ✅ |
+| 🚩 Feature Flag | Bonus tools gated behind `--enable-bonus` / `MMXOMNI_BONUS=1` | ✅ |
+
 ## Quick Start
 
 ```bash
@@ -509,6 +529,57 @@ The project uses:
 - **zod** for tool input schema validation
 - **undici** for HTTP requests
 - **vitest** for testing (with undici `MockAgent` for offline tests)
+
+## Architecture & Design Decisions
+
+### Feature Flag with Tri-State Resolution
+
+The `--enable-bonus` CLI flag uses a **tri-state** (`undefined | true | false`) to distinguish "not set" from "explicitly disabled". This allows the env var `MMXOMNI_BONUS=1` to take effect when no CLI flag is passed, while `--no-enable-bonus` overrides the env var:
+
+```
+CLI --enable-bonus   → true  (bonus tools registered)
+CLI not set, env=1   → true  (bonus tools registered)
+CLI not set, no env  → false (core tools only)
+CLI --no-enable-bonus + env=1 → false (CLI wins)
+```
+
+### MiniMax → MCP Error Code Mapping
+
+MiniMax API error codes are mapped to the mmx-cli exit-code convention, which aligns with MCP `isError` semantics:
+
+| MiniMax Code | HTTP Status | MCP Code | Meaning |
+|---|---|---|---|
+| `1001` / `1002` / `1007` | `401` / `403` | `3` | Authentication failure |
+| `1004` / `1005` / `10429` | `429` | `4` | Quota / rate limit |
+| — | `408` | `5` | Timeout |
+| `1026` / `1027` / `2013` / `2014` | `400` | `10` | Content filter / safety |
+| Any other | `5xx` | `1` | Generic / internal error |
+
+The mapping is resolved in `src/errors.ts` via `MmxcError.toMcpErrorCode()`, which checks the MiniMax-specific code table before falling back to the HTTP status mapping.
+
+### Async Video with Polling Seam
+
+`mmx_video_generate` submits a task and returns `{ task_id, status, model }` immediately. The companion `mmx_video_status` tool lets the agent poll for completion. An optional `wait=true` flag bundles the two into a single call: the tool polls at `poll_interval_seconds` (default 5s) up to `wait_timeout_seconds` (default 600s), returning the resolved task on success/fail or a timeout error with MCP code 5. The polling loop is injectable via a `sleepFn` seam for zero-wait tests.
+
+### Retry with Exponential Backoff
+
+The shared HTTP client (`MmxcClient`) retries 429 and 5xx responses up to 3 times with exponential backoff: `baseMs * 2^attempt` (default base 250ms → delays of 250ms, 500ms, 1s). 401/403/400/408 responses are never retried — they throw `MmxcError` immediately. The retry count is configurable via the `maxRetries` constructor option.
+
+### Credential Reuse from mmx-cli
+
+The server reads `~/.mmx/credentials.json` and `~/.mmx/config.json` directly — the same files used by the official `mmx-cli`. Users who already configured the CLI need zero additional setup. Credentials resolve in strict order: `--api-key` flag > `MINIMAX_API_KEY` env > credentials file > config file.
+
+### Region-Aware Base URL
+
+The base URL is selected by region at construction time:
+- `global` → `https://api.minimax.io/v1`
+- `cn` → `https://api.minimaxi.cn/v1`
+
+An explicit `--base-url` override bypasses the region lookup entirely, useful for testing against staging environments.
+
+### Offline Testing with Call History
+
+Every unit test uses `undici`'s `MockAgent` with `enableCallHistory()` enabled. Tests assert precise HTTP attempt counts (e.g., "exactly 4 attempts for a terminal 5xx") without relying on real network calls. The [smoke test](test/smoke.test.ts) is the only test that hits the live API, and it is gated behind `it.runIf(process.env.MINIMAX_API_KEY)` — skipped by default.
 
 ## License
 
