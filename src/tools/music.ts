@@ -1,13 +1,18 @@
 /**
  * mmx_music_generate — MiniMax music generation tool.
  *
- * Declares the tool name, description, and JSON-Schema inputSchema for
- * `mmx_music_generate`. Cross-field validation rules (`prompt`/`lyrics`
- * at-least-one, `instrumental=true` + `lyrics` mutual exclusion) are
- * enforced at handler runtime via `validateMusicInput`.
+ * Calls the MiniMax music generation endpoint (default model `music-2.5`).
+ * Cross-field validation rules (`prompt`/`lyrics` at-least-one,
+ * `instrumental=true` + `lyrics` mutual exclusion) are enforced at handler
+ * runtime via `validateMusicInput`. Returns the audio URL as text by
+ * default, or a base64 MCP `audio` content block when `embed=true`.
  */
 
 import { z } from 'zod';
+import { request as undiciRequest } from 'undici';
+
+import { MmxcError, normalizeApiError } from '../errors.js';
+import { log } from '../log.js';
 
 /** Canonical mmx-cli default model for music generation. */
 export const MUSIC_DEFAULT_MODEL = 'music-2.5';
@@ -132,37 +137,246 @@ export const MUSIC_GENERATE_DESCRIPTION =
 
 export const MUSIC_TOOL_NAME = 'mmx_music_generate';
 
-/**
- * Music handler. Runs the cross-field validator first, returns an MCP
- * `isError` result on failure, and otherwise returns a placeholder
- * response (the live HTTP call is not yet wired).
- */
-export async function musicGenerateHandler(args: Record<string, unknown>): Promise<{
-  content: Array<{ type: 'text'; text: string }>;
+/** mmx-cli default music generation endpoint path. */
+export const MUSIC_GENERATE_PATH = '/music_generation';
+
+/** MIME type for a given format. */
+function mimeFromFormat(fmt: string): string {
+  const f = fmt.toLowerCase();
+  if (f === 'wav') return 'audio/wav';
+  if (f === 'flac') return 'audio/flac';
+  return 'audio/mpeg'; // mp3
+}
+
+/** Extension for a given format. */
+function extFromFormat(fmt: string): string {
+  const f = fmt.toLowerCase();
+  if (f === 'wav') return 'wav';
+  if (f === 'flac') return 'flac';
+  return 'mp3';
+}
+
+/* ------------------------------------------------------------------ *
+ * Types for the MiniMax music endpoint response.                     *
+ * ------------------------------------------------------------------ */
+
+interface MusicGenerateResponse {
+  /** Hosted audio URL from the server. */
+  audio_url?: string;
+  /** Hex-encoded audio bytes (when format=hex is requested). */
+  data?: {
+    audio?: string;
+  };
+  /** Application-level status envelope. */
+  base_resp?: { status_code?: number; status_msg?: string };
+  /** Server-side metadata. */
+  extra_info?: Record<string, unknown>;
+}
+
+/* ------------------------------------------------------------------ *
+ * MCP tool result shape.                                            *
+ * ------------------------------------------------------------------ */
+
+type AudioContentBlock = { type: 'audio'; data: string; mimeType: string };
+type TextContentBlock = { type: 'text'; text: string };
+
+export interface MusicToolResult {
+  content: Array<AudioContentBlock | TextContentBlock>;
   isError?: boolean;
-}> {
-  const v = validateMusicInput(args);
-  if (!v.ok) {
+  [key: string]: unknown;
+}
+
+/** Format an error caught during the handler into the MCP result shape. */
+function formatMusicError(toolName: string, err: unknown): MusicToolResult {
+  if (err instanceof MmxcError) {
+    const code = err.toMcpErrorCode();
     return {
       isError: true,
-      content: [{ type: 'text' as const, text: `mmx_music_generate validation error: ${v.error}` }],
+      content: [
+        {
+          type: 'text',
+          text:
+            `${toolName}: ${err.message} ` +
+            `(mmx_code=${err.code}, http_status=${err.httpStatus}, mcp_code=${code})`,
+        },
+      ],
     };
   }
+  const msg = err instanceof Error ? err.message : String(err);
   return {
+    isError: true,
     content: [
-      {
-        type: 'text' as const,
-        text:
-          'mmxomni: music generation is declared and validates input, but the live API ' +
-          'call has not been wired up in this build.',
-      },
+      { type: 'text', text: `${toolName}: ${msg} (mmx_code=0, http_status=0, mcp_code=1)` },
     ],
   };
 }
 
+/* ------------------------------------------------------------------ *
+ * Real HTTP handler.                                                *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Music handler. Runs the cross-field validator, calls the MiniMax
+ * music generation API, and returns the audio as a URL (default) or
+ * as a base64 MCP `audio` content block when `embed=true`.
+ */
+export async function musicGenerateHandler(
+  rawArgs: Record<string, unknown>,
+  client: import('../client.js').MmxcClient,
+): Promise<MusicToolResult> {
+  const TOOL = MUSIC_TOOL_NAME;
+
+  // Cross-field validation.
+  const v = validateMusicInput(rawArgs);
+  if (!v.ok) {
+    return {
+      isError: true,
+      content: [{ type: 'text' as const, text: `${TOOL} validation error: ${v.error}` }],
+    };
+  }
+
+  const model = typeof rawArgs.model === 'string' && rawArgs.model ? rawArgs.model : MUSIC_DEFAULT_MODEL;
+  const format = (rawArgs.format === 'wav' || rawArgs.format === 'flac' ? rawArgs.format : 'mp3') as 'mp3' | 'wav' | 'flac';
+  const embed = rawArgs.embed === true;
+  const savePath = typeof rawArgs.save_path === 'string' && rawArgs.save_path ? rawArgs.save_path : undefined;
+  const instrumental = rawArgs.instrumental === true;
+
+  // Build the request body matching the MiniMax music generation API.
+  const body: Record<string, unknown> = {
+    model,
+    ...(typeof rawArgs.prompt === 'string' && rawArgs.prompt ? { prompt: rawArgs.prompt } : {}),
+    ...(typeof rawArgs.lyrics === 'string' && rawArgs.lyrics ? { lyrics: rawArgs.lyrics } : {}),
+    instrumental,
+    ...(typeof rawArgs.sample_rate === 'number' ? { sample_rate: rawArgs.sample_rate } : { sample_rate: 44100 }),
+    ...(typeof rawArgs.bitrate === 'number' ? { bitrate: rawArgs.bitrate } : { bitrate: 256000 }),
+    ...(rawArgs.format ? { format } : { format: 'mp3' }),
+    ...(rawArgs.aigc_watermark === true ? { aigc_watermark: true } : {}),
+  };
+
+  // Add optional control fields only when set.
+  if (typeof rawArgs.vocals === 'string' && rawArgs.vocals) body.vocals = rawArgs.vocals;
+  if (typeof rawArgs.genre === 'string' && rawArgs.genre) body.genre = rawArgs.genre;
+  if (typeof rawArgs.mood === 'string' && rawArgs.mood) body.mood = rawArgs.mood;
+  if (typeof rawArgs.instruments === 'string' && rawArgs.instruments) body.instruments = rawArgs.instruments;
+  if (typeof rawArgs.tempo === 'string' && rawArgs.tempo) body.tempo = rawArgs.tempo;
+  if (typeof rawArgs.bpm === 'number') body.bpm = rawArgs.bpm;
+  if (typeof rawArgs.key === 'string' && rawArgs.key) body.key = rawArgs.key;
+  if (typeof rawArgs.structure === 'string' && rawArgs.structure) body.structure = rawArgs.structure;
+  if (typeof rawArgs.references === 'string' && rawArgs.references) body.references = rawArgs.references;
+  if (typeof rawArgs.avoid === 'string' && rawArgs.avoid) body.avoid = rawArgs.avoid;
+  if (typeof rawArgs.use_case === 'string' && rawArgs.use_case) body.use_case = rawArgs.use_case;
+
+  let response: MusicGenerateResponse;
+  try {
+    response = await client.request<MusicGenerateResponse>({
+      method: 'POST',
+      path: MUSIC_GENERATE_PATH,
+      body,
+    });
+    const br = response.base_resp;
+    if (br && typeof br.status_code === 'number' && br.status_code !== 0) {
+      throw new MmxcError(normalizeApiError(200, response));
+    }
+  } catch (err) {
+    log.debug(`${TOOL} request failed:`, err);
+    return formatMusicError(TOOL, err);
+  }
+
+  // Resolve the audio URL or inline bytes.
+  const mimeType = mimeFromFormat(format);
+  const ext = extFromFormat(format);
+  let sourceUrl: string | undefined;
+  let audioData: string | undefined;
+
+  if (typeof response.audio_url === 'string' && response.audio_url) {
+    sourceUrl = response.audio_url;
+  } else if (response.data?.audio) {
+    // Hex-encoded inline audio.
+    audioData = Buffer.from(response.data.audio, 'hex').toString('base64');
+  }
+
+  // If embed is requested and we have a URL, download the bytes.
+  if (embed && sourceUrl && !audioData) {
+    try {
+      const { request as undiciRequest } = await import('undici');
+      const dlRes = await undiciRequest(sourceUrl);
+      if (dlRes.statusCode >= 200 && dlRes.statusCode < 300) {
+        const ab = await dlRes.body.arrayBuffer();
+        audioData = Buffer.from(ab).toString('base64');
+      } else {
+        log.warn(`${TOOL}: failed to download ${sourceUrl} for embed (HTTP ${dlRes.statusCode})`);
+      }
+    } catch (dlErr) {
+      log.warn(`${TOOL}: failed to download ${sourceUrl} for embed:`, dlErr);
+    }
+  }
+
+  if (!sourceUrl && !audioData) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text:
+            `${TOOL}: API returned no audio. ` +
+            `Response: ${JSON.stringify(response).slice(0, 2000)}`,
+        },
+      ],
+    };
+  }
+
+  // Optional: download to disk.
+  const savedPaths: string[] = [];
+  if (savePath && audioData) {
+    try {
+      const { mkdir, writeFile } = await import('node:fs/promises');
+      const { dirname } = await import('node:path');
+      await mkdir(dirname(savePath), { recursive: true });
+      await writeFile(savePath, Buffer.from(audioData, 'base64'));
+      savedPaths.push(savePath);
+    } catch (writeErr) {
+      log.warn(`${TOOL}: failed to save audio to ${savePath}:`, writeErr);
+    }
+  } else if (savePath && sourceUrl) {
+    try {
+      const { mkdir, writeFile } = await import('node:fs/promises');
+      const { dirname } = await import('node:path');
+      const { request as undiciRequest } = await import('undici');
+      await mkdir(dirname(savePath), { recursive: true });
+      const dlRes = await undiciRequest(sourceUrl);
+      if (dlRes.statusCode >= 200 && dlRes.statusCode < 300) {
+        const ab = await dlRes.body.arrayBuffer();
+        await writeFile(savePath, Buffer.from(ab));
+        savedPaths.push(savePath);
+      } else {
+        log.warn(`${TOOL}: failed to download for save_path (HTTP ${dlRes.statusCode})`);
+      }
+    } catch (writeErr) {
+      log.warn(`${TOOL}: failed to save to ${savePath}:`, writeErr);
+    }
+  }
+
+  // Build the result content.
+  const content: Array<AudioContentBlock | TextContentBlock> = [];
+  if (embed && audioData) {
+    content.push({ type: 'audio', data: audioData, mimeType });
+  } else if (sourceUrl) {
+    const parts = [`${TOOL}: audio generated at ${sourceUrl}`];
+    if (savedPaths.length > 0) parts.push(`Saved to: ${savedPaths.join(', ')}`);
+    content.push({ type: 'text', text: parts.join('\n') });
+  } else if (audioData) {
+    // Fallback: we have inline data but embed was false — unlikely but safe.
+    content.push({ type: 'text', text: `${TOOL}: audio generated (inline, ${audioData.length} base64 bytes)` });
+  }
+
+  return { content };
+}
+
 export function registerMusicTool(
   server: import('@modelcontextprotocol/sdk/server/mcp.js').McpServer,
-  _client: import('../client.js').MmxcClient,
+  client: import('../client.js').MmxcClient,
 ): void {
-  server.tool(MUSIC_TOOL_NAME, MUSIC_GENERATE_DESCRIPTION, MusicGenerateInputSchema, musicGenerateHandler);
+  server.tool(MUSIC_TOOL_NAME, MUSIC_GENERATE_DESCRIPTION, MusicGenerateInputSchema, async (args) => {
+    return musicGenerateHandler(args as Record<string, unknown>, client);
+  });
 }
